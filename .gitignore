@@ -1,0 +1,13 @@
+# Binaries
+certsync
+certsync.exe
+*.exe
+
+# CertSync specific
+.certsync-overlay.jsonc
+.certsync/
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
