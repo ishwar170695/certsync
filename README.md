@@ -1,3 +1,4 @@
+[![Go CI](https://github.com/ishwar170695/certsync/actions/workflows/ci.yml/badge.svg)](https://github.com/ishwar170695/certsync/actions/workflows/ci.yml)
 # certsync
 
 Injects your host machine's CA certificates — including corporate MITM proxy CAs — into Dev Containers, so tools inside the container (curl, npm, pip, go get) trust the same roots your host does.
