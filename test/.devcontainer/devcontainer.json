@@ -1,0 +1,6 @@
+{
+  "name": "CertSync Test Project",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace"
+}

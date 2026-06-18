@@ -1,0 +1,7 @@
+# Ignore caches and version managers
+.cache/
+versions/
+alias/
+
+# Ignore generated proxy certs
+certs/

@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    command: mitmdump --set block_global=false
+    restart: always
+    volumes:
+      - ./certs:/home/mitmproxy/.mitmproxy
+    ports:
+      - "8080:8080"
+    networks:
+      - test-net
+
+  devcontainer:
+    build: .
+    restart: always
+    user: node
+    volumes:
+      - .:/workspace
+      - ./certs:/certs
+    environment:
+      - http_proxy=http://mitmproxy:8080
+      - https_proxy=http://mitmproxy:8080
+      - HTTP_PROXY=http://mitmproxy:8080
+      - HTTPS_PROXY=http://mitmproxy:8080
+      - NO_PROXY=localhost,127.0.0.1
+      - NODE_EXTRA_CA_CERTS=/certs/mitmproxy-ca-cert.pem
+      - NODE_USE_SYSTEM_CA=1
+    depends_on:
+      - mitmproxy
+    networks:
+      - test-net
+    stdin_open: true
+    tty: true
+
+networks:
+  test-net:
+    driver: bridge
