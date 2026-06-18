@@ -145,30 +145,14 @@ Results are written to `~/.certsync/profiles.json`:
 
 The certsync feature is always first in `overrideFeatureInstallOrder` so CAs are trusted before any other feature makes network requests.
 
-### `install.sh` — distro detection
+### CA Injection & Runtime Wrapping (`install.sh` & `certsync-inject`)
 
-```sh
-if command -v update-ca-certificates > /dev/null 2>&1; then
-    cp /tmp/certsync-bundle.pem /usr/local/share/ca-certificates/certsync.crt
-    update-ca-certificates
-    CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-elif command -v update-ca-trust > /dev/null 2>&1; then
-    cp /tmp/certsync-bundle.pem /etc/pki/ca-trust/source/anchors/certsync.crt
-    update-ca-trust
-    CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
-else
-    echo "certsync: WARNING: no CA update command found" >&2
-    CA_BUNDLE=""
-fi
+When the feature is installed during the container build, it registers a `postStartCommand` hook pointing to `/usr/local/bin/certsync-inject`. This script operates on container boot and runs dynamically to ensure Node.js and Java runtimes trust the CAs:
 
-if [ -n "$CA_BUNDLE" ]; then
-    echo "NODE_EXTRA_CA_CERTS=$CA_BUNDLE" >> /etc/environment
-    echo "SSL_CERT_FILE=$CA_BUNDLE"       >> /etc/environment
-    echo "REQUESTS_CA_BUNDLE=$CA_BUNDLE"  >> /etc/environment
-fi
-```
-
-If a valid CA bundle path is found, it is propagated to `/etc/environment` so tools/runtimes that do not automatically query the system trust store (like Node.js, Python requests, or Go binaries respecting `SSL_CERT_FILE`) will trust the injected CA certificates.
+1. **System Trust Store Update:** Updates `/etc/ssl/certs` (on Debian/Ubuntu) or `/etc/pki/tls/certs` (on RHEL/Fedora) with the bundled certs.
+2. **Sudo Self-Escalation:** Runs seamlessly as non-root container users (e.g., `node`, `vscode`) by auto-escalating via passwordless `sudo` to write root-owned files.
+3. **Dynamic Node.js Binary wrapping:** Scans standard system bins and version manager directories (NVM, FNM, Volta) and wraps them in a location-independent shim that auto-injects `NODE_EXTRA_CA_CERTS` and `NODE_USE_SYSTEM_CA=1`. The wrapping is fully idempotent and skips already-wrapped files (by checking for the `# CERTSYNC_SHIM` header).
+4. **Symlink-Aware Java cacerts updates:** Resolves JDK keystores (including Debian-style symlinks to `/etc/ssl/certs/java/cacerts`) and imports the bundle using `keytool`, safely overwriting old configs when the host bundle changes.
 
 ---
 
@@ -179,34 +163,26 @@ If a valid CA bundle path is found, it is propagated to `/etc/environment` so to
 ├── profiles.json          # host cert scan results (written by init)
 └── ca-inject/             # devcontainer Feature (written by up, persistent)
     ├── devcontainer-feature.json
-    ├── install.sh
-    └── bundle.pem
-
-<project>/
-├── .devcontainer/
-│   └── devcontainer.json  # your original, untouched
-└── .certsync-overlay.jsonc  # ephemeral — deleted on success
+    ├── install.sh         # writes and executes certsync-inject
+    └── bundle.pem         # host's selected CA certificates
 ```
 
 ---
 
-## Limitations (v1)
+## Automated / Unattended Mode
 
-- **Local Docker only.** The feature path is an absolute host path. Remote SSH containers and WSL2 contexts where the devcontainer CLI runs with a different filesystem view are not yet supported.
-- **Debian/RHEL base images.** `install.sh` detects `update-ca-certificates` and `update-ca-trust`. Other distros will get a warning but the container will still start.
-- **Re-run on cert rotation.** MITM proxy CAs rotate. Run `certsync init` when you start seeing certificate errors again, then `certsync up` to rebuild.
+To run `certsync` inside an automated script or a CI workflow without showing the interactive TUI menu, pass the `--all-mitm` flag to `certsync up`:
+
+```bash
+certsync up --all-mitm
+```
+
+This will automatically select the `System Default` trust store profile and any detected corporate `MITM` proxy CA profiles, bundle them, and boot the container immediately.
 
 ---
 
-## Future / unattended mode
+## Limitations
 
-To skip the TUI and use all MITM-flagged profiles automatically (e.g. in `postCreateCommand`):
-
-```jsonc
-// devcontainer.json
-{
-  "postCreateCommand": "certsync up --all-mitm"  // not yet implemented
-}
-```
-
-This flag isn't implemented in v1. The interactive menu is the current interface.
+- **Local Docker only.** The feature path is an absolute host path. Remote SSH containers where the devcontainer CLI runs with a different filesystem view are not yet supported.
+- **Debian/RHEL base images.** The script detects standard tools like `update-ca-certificates` and `update-ca-trust`. 
+- **Re-run on cert rotation.** MITM proxy CAs rotate. Run `certsync init` when you start seeing certificate errors again, then `certsync up` to rebuild the container layers.

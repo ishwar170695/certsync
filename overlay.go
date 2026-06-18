@@ -136,11 +136,12 @@ type featureMount struct {
 }
 
 type featureManifest struct {
-	ID          string         `json:"id"`
-	Version     string         `json:"version"`
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Mounts      []featureMount `json:"mounts"`
+	ID               string         `json:"id"`
+	Version          string         `json:"version"`
+	Name             string         `json:"name"`
+	Description      string         `json:"description"`
+	Mounts           []featureMount `json:"mounts"`
+	PostStartCommand string         `json:"postStartCommand,omitempty"`
 }
 
 // install.sh is written into the Feature directory and run inside the container.
@@ -154,24 +155,138 @@ type featureManifest struct {
 const installSh = `#!/bin/sh
 set -e
 
-if command -v update-ca-certificates > /dev/null 2>&1; then
-    cp /tmp/certsync-bundle.pem /usr/local/share/ca-certificates/certsync.crt
-    update-ca-certificates
-    CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-elif command -v update-ca-trust > /dev/null 2>&1; then
-    cp /tmp/certsync-bundle.pem /etc/pki/ca-trust/source/anchors/certsync.crt
-    update-ca-trust
-    CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
-else
-    echo "certsync: WARNING: no CA update command found" >&2
-    CA_BUNDLE=""
+# Write the dynamic, idempotent injector script to /usr/local/bin/certsync-inject
+cat << 'EOF' > /usr/local/bin/certsync-inject
+#!/bin/sh
+set -e
+
+# Sudo self-escalation logic
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo > /dev/null 2>&1; then
+        if sudo -n true 2>/dev/null; then
+            exec sudo "$0" "$@"
+        else
+            echo "certsync: WARNING: sudo requires password. Skipping root-level operations."
+        fi
+    else
+        echo "certsync: WARNING: running as non-root and sudo is not installed. Skipping root-level operations."
+    fi
 fi
 
-if [ -n "$CA_BUNDLE" ]; then
-    echo "NODE_EXTRA_CA_CERTS=$CA_BUNDLE" >> /etc/environment
-    echo "SSL_CERT_FILE=$CA_BUNDLE"       >> /etc/environment
-    echo "REQUESTS_CA_BUNDLE=$CA_BUNDLE"  >> /etc/environment
+CA_PEM="/tmp/certsync-bundle.pem"
+
+# 1. Update OS System Trust Store (Idempotent)
+if [ "$(id -u)" -eq 0 ] && [ -f "$CA_PEM" ]; then
+    if command -v update-ca-certificates > /dev/null 2>&1; then
+        cp "$CA_PEM" /usr/local/share/ca-certificates/certsync.crt
+        update-ca-certificates
+        CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    elif command -v update-ca-trust > /dev/null 2>&1; then
+        cp "$CA_PEM" /etc/pki/ca-trust/source/anchors/certsync.crt
+        update-ca-trust
+        CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+    else
+        echo "certsync: WARNING: no CA update command found" >&2
+        CA_BUNDLE=""
+    fi
+
+    if [ -n "$CA_BUNDLE" ]; then
+        for var in "NODE_EXTRA_CA_CERTS=$CA_BUNDLE" "SSL_CERT_FILE=$CA_BUNDLE" "REQUESTS_CA_BUNDLE=$CA_BUNDLE" "NODE_USE_SYSTEM_CA=1"; do
+            key="${var%%=*}"
+            if ! grep -q "^$key=" /etc/environment; then
+                echo "$var" >> /etc/environment
+            fi
+        done
+    fi
 fi
+
+# 2. Scan and Wrap Node.js Binaries (Idempotent & Portable Shim)
+find_node_bins() {
+    # System paths
+    if [ "$(id -u)" -eq 0 ]; then
+        for p in /usr/bin/node /usr/local/bin/node; do
+            if [ -f "$p" ] && [ ! -L "$p" ]; then
+                echo "$p"
+            fi
+        done
+    fi
+    # Version managers (NVM, FNM, Volta)
+    for home_dir in /root /home/*; do
+        [ -d "$home_dir" ] || continue
+        if [ -d "$home_dir/.nvm/versions/node" ]; then
+            find "$home_dir/.nvm/versions/node" -type f -name "node" 2>/dev/null || true
+        fi
+        if [ -d "$home_dir/.fnm/node-versions" ]; then
+            find "$home_dir/.fnm/node-versions" -type f -name "node" 2>/dev/null || true
+        fi
+        if [ -d "$home_dir/.volta/tools/image/node" ]; then
+            find "$home_dir/.volta/tools/image/node" -type f -name "node" 2>/dev/null || true
+        fi
+    done
+}
+
+for node_bin in $(find_node_bins); do
+    if [ -f "$node_bin" ] && [ ! -L "$node_bin" ]; then
+        # Check if already wrapped
+        if head -n 3 "$node_bin" | grep -q "CERTSYNC_SHIM"; then
+            continue
+        fi
+
+        if [ -w "$node_bin" ] && [ -w "$(dirname "$node_bin")" ]; then
+            echo "certsync: Wrapping $node_bin..."
+            dir_name="$(dirname "$node_bin")"
+            real_bin="$dir_name/node-real"
+
+            mv "$node_bin" "$real_bin"
+
+            cat << 'SHIM' > "$node_bin"
+#!/bin/sh
+# CERTSYNC_SHIM
+export NODE_USE_SYSTEM_CA=1
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+elif [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+    export NODE_EXTRA_CA_CERTS=/etc/pki/tls/certs/ca-bundle.crt
+fi
+DIR="$(dirname "$0")"
+exec "$DIR/node-real" "$@"
+SHIM
+            chmod +x "$node_bin"
+        else
+            echo "certsync: Cannot write to $node_bin, skipping wrapping."
+        fi
+    fi
+done
+
+# 3. Scan and Inject Java Keystore (cacerts) (Idempotent)
+find_cacerts() {
+    find /usr/lib/jvm /opt /usr/local -name "cacerts" 2>/dev/null || true
+    for home_dir in /root /home/*; do
+        [ -d "$home_dir" ] || continue
+        if [ -d "$home_dir/.sdkman/candidates/java" ]; then
+            find "$home_dir/.sdkman/candidates/java" -name "cacerts" 2>/dev/null || true
+        fi
+    done
+}
+
+if [ -f "$CA_PEM" ] && command -v keytool > /dev/null 2>&1; then
+    for cacert in $(find_cacerts); do
+        if [ -w "$cacert" ]; then
+            # Always delete first so we update the keystore if the bundle has changed
+            keytool -delete -alias certsync -keystore "$cacert" -storepass changeit >/dev/null 2>&1 || true
+            echo "certsync: Importing CA into Java trust store: $cacert..."
+            keytool -importcert -trustcacerts -file "$CA_PEM" -keystore "$cacert" -storepass changeit -noprompt -alias certsync >/dev/null 2>&1 || true
+        else
+            echo "certsync: Cannot write to Java trust store $cacert, skipping."
+        fi
+    done
+fi
+EOF
+
+chmod +x /usr/local/bin/certsync-inject
+
+# Run immediately during build
+/usr/local/bin/certsync-inject || true
 `
 
 // writeFeatureDir creates ~/.certsync/ca-inject/ and writes:
@@ -213,6 +328,7 @@ func writeFeatureDir(home string, pemBundle []byte) (featureDir, bundlePath stri
 				Type:   "bind",
 			},
 		},
+		PostStartCommand: "/usr/local/bin/certsync-inject",
 	}
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

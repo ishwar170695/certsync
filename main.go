@@ -387,22 +387,43 @@ func runUp() {
 
 	fmt.Printf("Loaded %d profiles (%d total certificates) from %s\n\n", len(profiles), totalCertsCount, profilesPath)
 
-	// Initialize selected states — MITM proxies and System Default are pre-checked
-	checked := make([]bool, len(profiles))
-	for i, p := range profiles {
-		if p.IsMITM || p.Name == "System Default" {
-			checked[i] = true
+	allMitm := false
+	if len(os.Args) > 2 {
+		for _, arg := range os.Args[2:] {
+			if arg == "--all-mitm" {
+				allMitm = true
+				break
+			}
 		}
 	}
 
-	selectedProfiles, err := promptUserProfiles(profiles, checked)
-	if err != nil {
-		if err.Error() == "cancelled" {
-			fmt.Println("\n\x1b[1;31mOperation cancelled.\x1b[0m")
-			os.Exit(0)
+	var selectedProfiles []Profile
+	if allMitm {
+		fmt.Println("Running in non-interactive mode (--all-mitm). Automatically selecting MITM and System Default profiles.")
+		for _, p := range profiles {
+			if p.IsMITM || p.Name == "System Default" {
+				selectedProfiles = append(selectedProfiles, p)
+			}
 		}
-		fmt.Printf("\n\x1b[1;31mError during selection: %v\x1b[0m\n", err)
-		os.Exit(1)
+	} else {
+		// Initialize selected states — MITM proxies and System Default are pre-checked
+		checked := make([]bool, len(profiles))
+		for i, p := range profiles {
+			if p.IsMITM || p.Name == "System Default" {
+				checked[i] = true
+			}
+		}
+
+		var err error
+		selectedProfiles, err = promptUserProfiles(profiles, checked)
+		if err != nil {
+			if err.Error() == "cancelled" {
+				fmt.Println("\n\x1b[1;31mOperation cancelled.\x1b[0m")
+				os.Exit(0)
+			}
+			fmt.Printf("\n\x1b[1;31mError during selection: %v\x1b[0m\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if len(selectedProfiles) == 0 {
